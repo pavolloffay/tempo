@@ -11,6 +11,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-logfmt/logfmt"
@@ -53,12 +54,13 @@ var tlsVersions = map[string]uint16{
 }
 
 type Backend struct {
-	tempoBackend          string
-	tlsEnabled            bool
-	tls                   tlsCfg.ClientConfig
-	httpClient            *http.Client
-	tenantHeaderKey       string
-	QueryServicesDuration *time.Duration
+	tempoBackend                 string
+	tlsEnabled                   bool
+	tls                          tlsCfg.ClientConfig
+	httpClient                   *http.Client
+	tenantHeaderKey              string
+	QueryServicesDuration        *time.Duration
+	findTracesConcurrentRequests int
 }
 
 func New(cfg *Config) (*Backend, error) {
@@ -79,12 +81,13 @@ func New(cfg *Config) (*Backend, error) {
 	}
 
 	return &Backend{
-		tempoBackend:          cfg.Backend,
-		tlsEnabled:            cfg.TLSEnabled,
-		tls:                   cfg.TLS,
-		httpClient:            httpClient,
-		tenantHeaderKey:       cfg.TenantHeaderKey,
-		QueryServicesDuration: queryServiceDuration,
+		tempoBackend:                 cfg.Backend,
+		tlsEnabled:                   cfg.TLSEnabled,
+		tls:                          cfg.TLS,
+		httpClient:                   httpClient,
+		tenantHeaderKey:              cfg.TenantHeaderKey,
+		QueryServicesDuration:        queryServiceDuration,
+		findTracesConcurrentRequests: cfg.FindTracesConcurrentRequests,
 	}, nil
 }
 
@@ -276,6 +279,33 @@ func (b *Backend) GetOperations(ctx context.Context, _ jaeger_spanstore.Operatio
 	return operations, nil
 }
 
+type Job struct {
+	ctx     context.Context
+	traceID jaeger.TraceID
+}
+
+func worker(b *Backend, jobs <-chan Job, results chan<- *jaeger.Trace, wg *sync.WaitGroup) {
+	for job := range jobs {
+		trace, _ := b.GetTrace(job.ctx, job.traceID)
+		// TODO this seems to be an internal inconsistency error, ignore so we can still show the rest
+		//span.LogFields(ot_log.Error(fmt.Errorf("could not get trace for traceID %v: %w", traceID, err)))
+		results <- trace
+		wg.Done()
+	}
+}
+
+func dedupTraceIDs(traceIDs []jaeger.TraceID) []jaeger.TraceID {
+	allKeys := make(map[jaeger.TraceID]bool)
+	var list []jaeger.TraceID
+	for _, item := range traceIDs {
+		if _, value := allKeys[item]; !value {
+			allKeys[item] = true
+			list = append(list, item)
+		}
+	}
+	return list
+}
+
 func (b *Backend) FindTraces(ctx context.Context, query *jaeger_spanstore.TraceQueryParameters) ([]*jaeger.Trace, error) {
 	span, ctx := opentracing.StartSpanFromContext(ctx, "tempo-query.FindTraces")
 	defer span.Finish()
@@ -284,21 +314,47 @@ func (b *Backend) FindTraces(ctx context.Context, query *jaeger_spanstore.TraceQ
 	if err != nil {
 		return nil, err
 	}
+	traceIDs = dedupTraceIDs(traceIDs)
 
 	span.LogFields(ot_log.String("msg", fmt.Sprintf("Found %d trace IDs", len(traceIDs))))
 
-	// for every traceID, get the full trace
-	var jaegerTraces []*jaeger.Trace
-	for _, traceID := range traceIDs {
-		trace, err := b.GetTrace(ctx, traceID)
-		if err != nil {
-			// TODO this seems to be an internal inconsistency error, ignore so we can still show the rest
-			span.LogFields(ot_log.Error(fmt.Errorf("could not get trace for traceID %v: %w", traceID, err)))
-			continue
-		}
+	numWorkers := b.findTracesConcurrentRequests
 
-		jaegerTraces = append(jaegerTraces, trace)
+	jobs := make(chan Job, len(traceIDs))
+	results := make(chan *jaeger.Trace, len(traceIDs))
+	var wg sync.WaitGroup
+	// Start workers
+	for w := 0; w < numWorkers; w++ {
+		go worker(b, jobs, results, &wg)
 	}
+	wg.Add(len(traceIDs))
+	for _, traceID := range traceIDs {
+		jobs <- Job{
+			ctx:     ctx,
+			traceID: traceID,
+		}
+	}
+	close(jobs)
+	wg.Wait()
+	// Collecting results
+	var jaegerTraces []*jaeger.Trace
+	for i := 0; i < len(traceIDs); i++ {
+		jaegerTraces = append(jaegerTraces, <-results)
+	}
+	close(results)
+
+	//// for every traceID, get the full trace
+	//var jaegerTraces []*jaeger.Trace
+	//for _, traceID := range traceIDs {
+	//	trace, err := b.GetTrace(ctx, traceID)
+	//	if err != nil {
+	//		// TODO this seems to be an internal inconsistency error, ignore so we can still show the rest
+	//		span.LogFields(ot_log.Error(fmt.Errorf("could not get trace for traceID %v: %w", traceID, err)))
+	//		continue
+	//	}
+	//
+	//	jaegerTraces = append(jaegerTraces, trace)
+	//}
 
 	span.LogFields(ot_log.String("msg", fmt.Sprintf("Returning %d traces", len(jaegerTraces))))
 
